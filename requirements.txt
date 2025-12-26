@@ -1,0 +1,34 @@
+# Voice Assistant Dependencies
+# Tested for Raspberry Pi 4 compatibility
+
+# Wakeword Detection (offline)
+pvporcupine==3.0.2
+
+# Audio I/O
+pyaudio==0.2.14
+sounddevice==0.4.6
+numpy==1.26.4
+
+# Gemini Live API (WebSocket)
+websockets==12.0
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+
+# Google Calendar API
+google-api-python-client==2.126.0
+google-auth-httplib2==0.2.0
+
+# Configuration
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+
+# Audio utilities
+scipy==1.13.0
+
+# Music playback
+yt-dlp>=2024.1.0
+psutil>=5.9.0
+
+# Logging
+colorlog==6.8.2
