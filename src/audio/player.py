@@ -120,6 +120,10 @@ class AudioPlayer:
         """Play wakeword activation sound."""
         self.play_sound(config.assistant.activation_sound)
     
+    def play_deactivation_sound(self) -> None:
+        """Play conversation end sound."""
+        self.play_sound(config.assistant.deactivation_sound)
+    
     def start_playback(self) -> None:
         """Start the playback system."""
         with self._buffer_lock:

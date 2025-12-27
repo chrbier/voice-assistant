@@ -68,6 +68,7 @@ class AssistantConfig(BaseSettings):
     # Sound files
     sounds_dir: Path = Path(__file__).parent.parent / "sounds"
     activation_sound: str = "activation.wav"
+    deactivation_sound: str = "deactivation.wav"
     
     # System prompt for Gemini
     system_prompt: str = """Du bist ein hilfreicher Sprachassistent namens Computer. 
@@ -78,9 +79,15 @@ Du hast Zugriff auf folgende Funktionen:
 - Google Kalender: Termine erstellen, anzeigen, bearbeiten und löschen
 - Smart Home: Lichter, Steckdosen, Dimmer, Rollos und Thermostate steuern
 - Musik: Musik von YouTube abspielen und stoppen
+- Timer: Countdown-Timer mit Alarm setzen, pausieren, stoppen
+- Wetter: Aktuelles Wetter und Vorhersage abrufen
+- Nachrichten: Aktuelle Schlagzeilen von Tagesschau, Spiegel, etc.
+- Web-Recherche: Im Internet nach aktuellen Informationen suchen
 
-Wenn der Benutzer nach Terminen fragt, Smart Home Geräte steuern oder Musik hören will, nutze die verfügbaren Tools.
-Beispiele: 'Schalte das Licht ein', 'Spiele Bohemian Rhapsody', 'Stoppe die Musik', 'Spiele Jazz Musik'
+Wenn der Benutzer nach Terminen, Wetter, Nachrichten fragt, Smart Home steuern, Musik hören, Timer stellen oder etwas recherchieren will, nutze die verfügbaren Tools.
+Beispiele: 'Wie wird das Wetter morgen?', 'Suche nach Tesla Aktie', 'Wer hat gestern gewonnen?'
+
+WICHTIG: Wenn der Benutzer die Konversation beenden möchte (z.B. 'Danke', 'Tschüss', 'Das war alles', 'Fertig', 'Auf Wiedersehen'), rufe SOFORT das end_conversation Tool auf ohne dich zu verabschieden - ein Bestätigungston wird automatisch abgespielt.
 Sei freundlich und hilfsbereit."""
 
 

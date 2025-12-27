@@ -25,6 +25,10 @@ from src.gemini.client import GeminiLiveClient
 from src.tools.calendar import GoogleCalendarTool
 from src.tools.smarthome import SmartHomeTool
 from src.tools.music import MusicTool
+from src.tools.timer import TimerTool
+from src.tools.weather import WeatherTool
+from src.tools.news import NewsTool
+from src.tools.websearch import WebSearchTool
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +47,16 @@ class VoiceAssistant:
         self._calendar_tool: Optional[GoogleCalendarTool] = None
         self._smarthome_tool: Optional[SmartHomeTool] = None
         self._music_tool: Optional[MusicTool] = None
+        self._timer_tool: Optional[TimerTool] = None
+        self._weather_tool: Optional[WeatherTool] = None
+        self._news_tool: Optional[NewsTool] = None
+        self._websearch_tool: Optional[WebSearchTool] = None
         
         self._is_running = False
         self._is_in_conversation = False
         self._conversation_start_time: Optional[datetime] = None
         self._last_activity_time: Optional[datetime] = None
+        self._end_conversation_requested = False  # For early conversation ending
         
         # Conversation timeout check interval
         self._timeout_check_interval = 1.0  # seconds
@@ -100,6 +109,42 @@ class VoiceAssistant:
         except Exception as e:
             logger.warning(f"Musik-Player nicht verfügbar: {e}")
             self._music_tool = None
+        
+        # Initialize Timer tool
+        self._timer_tool = TimerTool(audio_player=self._audio_player)
+        try:
+            self._timer_tool.initialize()
+            logger.info("✓ Timer verfügbar")
+        except Exception as e:
+            logger.warning(f"Timer nicht verfügbar: {e}")
+            self._timer_tool = None
+        
+        # Initialize Weather tool (optional - requires API key)
+        self._weather_tool = WeatherTool()
+        try:
+            self._weather_tool.initialize()
+            logger.info("✓ Wetter verfügbar")
+        except Exception as e:
+            logger.warning(f"Wetter nicht verfügbar: {e}")
+            self._weather_tool = None
+        
+        # Initialize News tool
+        self._news_tool = NewsTool()
+        try:
+            self._news_tool.initialize()
+            logger.info("✓ Nachrichten verfügbar")
+        except Exception as e:
+            logger.warning(f"Nachrichten nicht verfügbar: {e}")
+            self._news_tool = None
+        
+        # Initialize Web Search tool (optional - requires API key)
+        self._websearch_tool = WebSearchTool()
+        try:
+            self._websearch_tool.initialize()
+            logger.info("✓ Web-Recherche verfügbar")
+        except Exception as e:
+            logger.warning(f"Web-Recherche nicht verfügbar: {e}")
+            self._websearch_tool = None
         
         # Register all available tools
         self._register_tools()
@@ -156,7 +201,77 @@ class VoiceAssistant:
                     )
                     tools_registered += 1
         
+        # Register Timer tools
+        if self._timer_tool:
+            for tool_def in self._timer_tool.get_tool_definitions():
+                handler = self._timer_tool.get_tool_handlers().get(tool_def["name"])
+                if handler:
+                    self._gemini_client.register_tool(
+                        name=tool_def["name"],
+                        description=tool_def["description"],
+                        parameters=tool_def["parameters"],
+                        handler=handler
+                    )
+                    tools_registered += 1
+        
+        # Register Weather tools
+        if self._weather_tool:
+            for tool_def in self._weather_tool.get_tool_definitions():
+                handler = self._weather_tool.get_tool_handlers().get(tool_def["name"])
+                if handler:
+                    self._gemini_client.register_tool(
+                        name=tool_def["name"],
+                        description=tool_def["description"],
+                        parameters=tool_def["parameters"],
+                        handler=handler
+                    )
+                    tools_registered += 1
+        
+        # Register News tools
+        if self._news_tool:
+            for tool_def in self._news_tool.get_tool_definitions():
+                handler = self._news_tool.get_tool_handlers().get(tool_def["name"])
+                if handler:
+                    self._gemini_client.register_tool(
+                        name=tool_def["name"],
+                        description=tool_def["description"],
+                        parameters=tool_def["parameters"],
+                        handler=handler
+                    )
+                    tools_registered += 1
+        
+        # Register Web Search tools
+        if self._websearch_tool:
+            for tool_def in self._websearch_tool.get_tool_definitions():
+                handler = self._websearch_tool.get_tool_handlers().get(tool_def["name"])
+                if handler:
+                    self._gemini_client.register_tool(
+                        name=tool_def["name"],
+                        description=tool_def["description"],
+                        parameters=tool_def["parameters"],
+                        handler=handler
+                    )
+                    tools_registered += 1
+        
+        # Register conversation control tool (always available)
+        self._gemini_client.register_tool(
+            name="end_conversation",
+            description="Beendet die aktuelle Konversation und wechselt zurück in den Wakeword-Modus. Nutze dies wenn der Benutzer sich verabschiedet, 'Danke' sagt, 'Tschüss', 'Auf Wiedersehen', 'Das war alles', 'Fertig', oder explizit die Konversation beenden möchte.",
+            parameters={
+                "type": "object",
+                "properties": {}
+            },
+            handler=self._handle_end_conversation
+        )
+        tools_registered += 1
+        
         logger.info(f"✓ {tools_registered} Tools registriert")
+    
+    def _handle_end_conversation(self) -> str:
+        """Handle end conversation request from Gemini."""
+        logger.info("🔚 Benutzer möchte Konversation beenden")
+        self._end_conversation_requested = True
+        return "Konversation wird beendet. Auf Wiedersehen!"
     
     def _on_gemini_audio(self, audio_data: bytes) -> None:
         """Handle audio response from Gemini."""
@@ -314,11 +429,18 @@ class VoiceAssistant:
             logger.error(f"Response-Empfang Fehler: {e}")
     
     async def _conversation_timeout_loop(self) -> None:
-        """Monitor conversation timeout."""
+        """Monitor conversation timeout and early end requests."""
         timeout = config.assistant.conversation_timeout
         
         while self._is_in_conversation:
             await asyncio.sleep(self._timeout_check_interval)
+            
+            # Check for early end request
+            if self._end_conversation_requested:
+                logger.info("👋 Konversation wird auf Anfrage beendet")
+                self._is_in_conversation = False
+                self._end_conversation_requested = False
+                break
             
             if self._last_activity_time:
                 elapsed = (datetime.now() - self._last_activity_time).total_seconds()
@@ -340,6 +462,9 @@ class VoiceAssistant:
         
         # Disconnect from Gemini
         await self._gemini_client.disconnect()
+        
+        # Play deactivation sound
+        self._audio_player.play_deactivation_sound()
         
         logger.info("Zurück im Wakeword-Modus")
     
