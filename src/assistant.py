@@ -381,15 +381,15 @@ class VoiceAssistant:
     async def _conversation_loop(self) -> None:
         """Main conversation loop - streams audio to Gemini and receives responses."""
         
-        # Start tasks for sending audio and receiving responses
+        # Start tasks for sending audio, Gemini session, and timeout
         send_task = asyncio.create_task(self._send_audio_loop())
-        receive_task = asyncio.create_task(self._receive_response_loop())
+        session_task = asyncio.create_task(self._gemini_client.run_session())
         timeout_task = asyncio.create_task(self._conversation_timeout_loop())
         
         try:
             # Wait for any task to complete (usually timeout)
             done, pending = await asyncio.wait(
-                [send_task, receive_task, timeout_task],
+                [send_task, session_task, timeout_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
             
@@ -417,16 +417,10 @@ class VoiceAssistant:
             logger.error(f"Audio-Senden Fehler: {e}")
     
     async def _receive_response_loop(self) -> None:
-        """Receive and process responses from Gemini."""
-        try:
-            async for response in self._gemini_client.receive_responses():
-                if not self._is_in_conversation:
-                    break
-                
-                # Response processing is handled by callbacks
-                
-        except Exception as e:
-            logger.error(f"Response-Empfang Fehler: {e}")
+        """Legacy - responses now handled by Gemini client internally."""
+        # Keep running while in conversation
+        while self._is_in_conversation:
+            await asyncio.sleep(0.1)
     
     async def _conversation_timeout_loop(self) -> None:
         """Monitor conversation timeout and early end requests."""

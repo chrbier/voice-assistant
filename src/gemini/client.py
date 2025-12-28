@@ -1,15 +1,14 @@
 """
-Gemini Live API Client for real-time audio streaming.
-Uses WebSocket for bidirectional audio communication with native audio support.
+Gemini Live API Client using official Google GenAI SDK.
+Based on official Google documentation example.
 """
 
 import asyncio
-import base64
-import json
 import logging
-from typing import AsyncGenerator, Callable, Optional, Any
-import websockets
-from websockets.client import WebSocketClientProtocol
+from typing import Callable, Optional, Any
+
+from google import genai
+from google.genai import types
 
 from src.config import config
 
@@ -18,30 +17,28 @@ logger = logging.getLogger(__name__)
 
 class GeminiLiveClient:
     """
-    Client for Gemini Live API with native audio support.
+    Client for Gemini Live API using official Google GenAI SDK.
     Handles bidirectional audio streaming and tool calls.
     """
     
     def __init__(self):
-        self._ws: Optional[WebSocketClientProtocol] = None
+        self._client = genai.Client(api_key=config.gemini.api_key)
+        self._session = None
+        self._session_context = None
         self._is_connected = False
-        self._is_streaming = False
         self._tools: list[dict] = []
         self._tool_handlers: dict[str, Callable] = {}
         self._on_audio_response: Optional[Callable[[bytes], None]] = None
         self._on_text_response: Optional[Callable[[str], None]] = None
         self._on_turn_complete: Optional[Callable[[], None]] = None
         
-    def register_tool(self, name: str, description: str, parameters: dict, handler: Callable) -> None:
-        """
-        Register a tool for function calling.
+        # Audio queues for the session
+        self._audio_input_queue: asyncio.Queue = None
+        self._receive_task: asyncio.Task = None
+        self._send_task: asyncio.Task = None
         
-        Args:
-            name: Tool name
-            description: Tool description
-            parameters: JSON schema for parameters
-            handler: Async function to handle tool calls
-        """
+    def register_tool(self, name: str, description: str, parameters: dict, handler: Callable) -> None:
+        """Register a tool for function calling."""
         self._tools.append({
             "name": name,
             "description": description,
@@ -61,209 +58,161 @@ class GeminiLiveClient:
         self._on_text_response = on_text
         self._on_turn_complete = on_turn_complete
     
+    def _build_tools_config(self) -> Optional[list]:
+        """Build tools configuration for Gemini."""
+        if not self._tools:
+            return None
+        
+        function_declarations = []
+        for tool in self._tools:
+            function_declarations.append(
+                types.FunctionDeclaration(
+                    name=tool["name"],
+                    description=tool["description"],
+                    parameters=tool["parameters"]
+                )
+            )
+        
+        return [types.Tool(function_declarations=function_declarations)]
+    
+    def _build_config(self) -> dict:
+        """Build configuration for Live API session."""
+        cfg = {
+            "response_modalities": ["AUDIO"],
+            "system_instruction": config.assistant.system_prompt,
+        }
+        
+        tools = self._build_tools_config()
+        if tools:
+            cfg["tools"] = tools
+        
+        return cfg
+    
     async def connect(self) -> None:
-        """Establish WebSocket connection to Gemini Live API."""
+        """Establish connection to Gemini Live API."""
         if self._is_connected:
             logger.warning("Bereits verbunden")
             return
         
-        # Build WebSocket URL with API key
-        ws_url = f"{config.gemini.ws_url}?key={config.gemini.api_key}"
-        
         try:
-            self._ws = await websockets.connect(
-                ws_url,
-                extra_headers={
-                    "Content-Type": "application/json"
-                },
-                ping_interval=30,
-                ping_timeout=10
-            )
-            self._is_connected = True
-            logger.info("Mit Gemini Live API verbunden")
+            self._audio_input_queue = asyncio.Queue(maxsize=100)
             
-            # Send setup message
-            await self._send_setup()
+            # Create session context manager
+            live_config = self._build_config()
+            self._session_context = self._client.aio.live.connect(
+                model=config.gemini.model,
+                config=live_config
+            )
+            
+            # Enter the context
+            self._session = await self._session_context.__aenter__()
+            self._is_connected = True
+            logger.info("✓ Mit Gemini Live API verbunden (Official SDK)")
             
         except Exception as e:
             logger.error(f"Verbindungsfehler: {e}")
             raise
     
-    async def _send_setup(self) -> None:
-        """Send initial setup message with configuration."""
-        setup_message = {
-            "setup": {
-                "model": f"models/{config.gemini.model}",
-                "generation_config": {
-                    "response_modalities": ["AUDIO"],
-                    "speech_config": {
-                        "voice_config": {
-                            "prebuilt_voice_config": {
-                                "voice_name": "Aoede"  # German-compatible voice
-                            }
-                        }
-                    }
-                },
-                "system_instruction": {
-                    "parts": [{"text": config.assistant.system_prompt}]
-                },
-                "tools": self._build_tools_config()
-            }
-        }
-        
-        await self._send_message(setup_message)
-        logger.debug("Setup-Nachricht gesendet")
-        
-        # Wait for setup complete
-        response = await self._ws.recv()
-        data = json.loads(response)
-        
-        if "setupComplete" in data:
-            logger.info("Gemini Setup abgeschlossen")
-        else:
-            logger.warning(f"Unerwartete Setup-Antwort: {data}")
-    
-    def _build_tools_config(self) -> list[dict]:
-        """Build tools configuration for Gemini."""
-        if not self._tools:
-            return []
-        
-        return [{
-            "function_declarations": self._tools
-        }]
-    
-    async def _send_message(self, message: dict) -> None:
-        """Send JSON message via WebSocket."""
-        if not self._ws:
-            raise RuntimeError("Nicht verbunden")
-        
-        await self._ws.send(json.dumps(message))
-    
     async def send_audio(self, audio_data: bytes) -> None:
-        """
-        Send audio chunk to Gemini.
-        Audio should be 16kHz, 16-bit, mono PCM.
-        """
-        if not self._is_connected:
+        """Queue audio chunk for sending to Gemini."""
+        if not self._is_connected or not self._audio_input_queue:
             return
-        
-        # Encode audio as base64
-        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-        
-        message = {
-            "realtime_input": {
-                "media_chunks": [{
-                    "data": audio_b64,
-                    "mime_type": "audio/pcm;rate=16000"
-                }]
-            }
-        }
-        
-        await self._send_message(message)
-    
-    async def send_text(self, text: str) -> None:
-        """Send text message to Gemini."""
-        if not self._is_connected:
-            return
-        
-        message = {
-            "client_content": {
-                "turns": [{
-                    "role": "user",
-                    "parts": [{"text": text}]
-                }],
-                "turn_complete": True
-            }
-        }
-        
-        await self._send_message(message)
-    
-    async def end_turn(self) -> None:
-        """Signal end of user turn."""
-        if not self._is_connected:
-            return
-        
-        message = {
-            "client_content": {
-                "turn_complete": True
-            }
-        }
-        
-        await self._send_message(message)
-    
-    async def receive_responses(self) -> AsyncGenerator[dict, None]:
-        """
-        Async generator for receiving responses from Gemini.
-        Yields parsed response data.
-        """
-        if not self._ws:
-            return
-        
-        self._is_streaming = True
         
         try:
-            async for message in self._ws:
-                try:
-                    data = json.loads(message)
-                    yield data
-                    
-                    # Process response
-                    await self._process_response(data)
-                    
-                except json.JSONDecodeError:
-                    logger.warning(f"Ungültige JSON-Nachricht: {message[:100]}")
-                    
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("WebSocket-Verbindung geschlossen")
-            self._is_connected = False
-        except Exception as e:
-            logger.error(f"Empfangsfehler: {e}")
-        finally:
-            self._is_streaming = False
+            # Put in queue, drop if full
+            self._audio_input_queue.put_nowait({
+                "data": audio_data,
+                "mime_type": "audio/pcm"
+            })
+        except asyncio.QueueFull:
+            pass  # Drop frame if queue is full
     
-    async def _process_response(self, data: dict) -> None:
+    async def _send_audio_loop(self) -> None:
+        """Internal loop to send audio from queue to Gemini."""
+        try:
+            while self._is_connected and self._session:
+                try:
+                    msg = await asyncio.wait_for(
+                        self._audio_input_queue.get(),
+                        timeout=0.1
+                    )
+                    await self._session.send_realtime_input(audio=msg)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    if "closed" not in str(e).lower():
+                        logger.error(f"Audio-Senden Fehler: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+    
+    async def _receive_audio_loop(self) -> None:
+        """Internal loop to receive responses from Gemini."""
+        try:
+            while self._is_connected and self._session:
+                try:
+                    turn = self._session.receive()
+                    async for response in turn:
+                        await self._process_response(response)
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "closed" in error_str or "cancelled" in error_str:
+                        break
+                    logger.error(f"Empfangsfehler: {e}")
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+    
+    async def run_session(self) -> None:
+        """Run the send and receive loops. Call this after connect()."""
+        if not self._is_connected:
+            return
+        
+        try:
+            async with asyncio.TaskGroup() as tg:
+                self._send_task = tg.create_task(self._send_audio_loop())
+                self._receive_task = tg.create_task(self._receive_audio_loop())
+        except* Exception as eg:
+            for e in eg.exceptions:
+                if not isinstance(e, asyncio.CancelledError):
+                    logger.error(f"Session-Fehler: {e}")
+    
+    async def _process_response(self, response) -> None:
         """Process a response message from Gemini."""
         
         # Handle server content (audio/text responses)
-        if "serverContent" in data:
-            content = data["serverContent"]
+        if response.server_content:
+            content = response.server_content
             
-            # Check for model turn
-            if "modelTurn" in content:
-                model_turn = content["modelTurn"]
-                
-                for part in model_turn.get("parts", []):
+            if content.model_turn:
+                for part in content.model_turn.parts:
                     # Handle audio response
-                    if "inlineData" in part:
-                        inline_data = part["inlineData"]
-                        if inline_data.get("mimeType", "").startswith("audio/"):
-                            audio_bytes = base64.b64decode(inline_data["data"])
-                            if self._on_audio_response:
-                                self._on_audio_response(audio_bytes)
+                    if part.inline_data and isinstance(part.inline_data.data, bytes):
+                        if self._on_audio_response:
+                            self._on_audio_response(part.inline_data.data)
                     
                     # Handle text response
-                    if "text" in part:
+                    if part.text:
                         if self._on_text_response:
-                            self._on_text_response(part["text"])
+                            self._on_text_response(part.text)
             
-            # Check for turn complete
-            if content.get("turnComplete"):
+            if content.turn_complete:
                 logger.debug("Turn abgeschlossen")
                 if self._on_turn_complete:
                     self._on_turn_complete()
         
         # Handle tool calls
-        if "toolCall" in data:
-            await self._handle_tool_call(data["toolCall"])
+        if response.tool_call:
+            await self._handle_tool_call(response.tool_call)
     
-    async def _handle_tool_call(self, tool_call: dict) -> None:
+    async def _handle_tool_call(self, tool_call) -> None:
         """Handle a tool call from Gemini."""
-        function_calls = tool_call.get("functionCalls", [])
+        function_calls = tool_call.function_calls or []
         
         for fc in function_calls:
-            name = fc.get("name")
-            args = fc.get("args", {})
-            call_id = fc.get("id")
+            name = fc.name
+            args = dict(fc.args) if fc.args else {}
+            call_id = fc.id
             
             logger.info(f"🔧 Tool-Aufruf: {name}({args})")
             
@@ -271,13 +220,11 @@ class GeminiLiveClient:
                 try:
                     handler = self._tool_handlers[name]
                     
-                    # Call handler (async or sync)
                     if asyncio.iscoroutinefunction(handler):
                         result = await handler(**args)
                     else:
                         result = handler(**args)
                     
-                    # Send tool response
                     await self._send_tool_response(call_id, name, result)
                     
                 except Exception as e:
@@ -289,8 +236,9 @@ class GeminiLiveClient:
     
     async def _send_tool_response(self, call_id: str, name: str, result: Any) -> None:
         """Send tool response back to Gemini."""
-        # Gemini expects response as a Struct (JSON object), not a plain string
-        # Wrap string results in an object
+        if not self._session:
+            return
+        
         if isinstance(result, str):
             response_obj = {"result": result}
         elif isinstance(result, dict):
@@ -298,35 +246,60 @@ class GeminiLiveClient:
         else:
             response_obj = {"result": str(result)}
         
-        message = {
-            "tool_response": {
-                "function_responses": [{
-                    "id": call_id,
-                    "name": name,
-                    "response": response_obj
-                }]
-            }
-        }
-        
-        await self._send_message(message)
-        logger.debug(f"Tool-Antwort gesendet für {name}")
+        try:
+            await self._session.send_tool_response(
+                function_responses=[
+                    types.FunctionResponse(
+                        id=call_id,
+                        name=name,
+                        response=response_obj
+                    )
+                ]
+            )
+            logger.debug(f"Tool-Antwort gesendet für {name}")
+        except Exception as e:
+            logger.error(f"Tool-Response Fehler: {e}")
     
     async def disconnect(self) -> None:
-        """Close WebSocket connection."""
-        self._is_streaming = False
+        """Close connection to Gemini."""
         self._is_connected = False
         
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        # Cancel tasks
+        if self._send_task and not self._send_task.done():
+            self._send_task.cancel()
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+        
+        # Exit session context
+        if self._session_context:
+            try:
+                await self._session_context.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug(f"Disconnect: {e}")
+            self._session = None
+            self._session_context = None
             logger.info("Gemini-Verbindung getrennt")
+    
+    # Legacy methods for compatibility with assistant.py
+    async def send_text(self, text: str) -> None:
+        """Send text message to Gemini."""
+        pass
+    
+    async def end_turn(self) -> None:
+        """Signal end of user turn."""
+        pass
+    
+    async def receive_responses(self):
+        """Legacy - now handled internally."""
+        # Keep running while connected
+        while self._is_connected:
+            await asyncio.sleep(0.1)
+        yield None  # Make it a generator
     
     @property
     def is_connected(self) -> bool:
-        """Check if connected to Gemini."""
         return self._is_connected
     
     @property
     def is_streaming(self) -> bool:
-        """Check if currently streaming."""
-        return self._is_streaming
+        return self._is_connected

@@ -1,11 +1,12 @@
 """
 Smart Home Tool for ioBroker integration.
 Controls devices via ioBroker Simple API.
+Uses Alexa2 Smart-Home-Devices for reliable device discovery.
 """
 
 import logging
 import requests
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from src.config import config
 
 logger = logging.getLogger(__name__)
@@ -14,20 +15,205 @@ logger = logging.getLogger(__name__)
 class SmartHomeTool:
     """
     Smart Home control via ioBroker Simple API.
-    Supports lights, switches, dimmers, blinds, and thermostats.
+    Uses Alexa2 Smart-Home-Devices for reliable device discovery.
+    - Blinds: Blind-Lift-rangeValue (0-100)
+    - Lights/Switches: Powerstate (true/false)
     """
+    
+    ALEXA_DEVICES_PREFIX = "alexa2.0.Smart-Home-Devices"
     
     def __init__(self):
         self.base_url = f"http://{config.smarthome.iobroker_host}:{config.smarthome.iobroker_port}"
         self._timeout = 5  # seconds
-        self._device_cache = {}  # Cache for device states
+        self._devices = {}  # name -> device info
+    
+    def _get_device_name(self, uuid: str) -> Optional[str]:
+        """Get device name by fetching the channel object directly."""
+        try:
+            obj_id = f"{self.ALEXA_DEVICES_PREFIX}.{uuid}"
+            # Use /get/ endpoint (not /getObject/)
+            response = requests.get(
+                f"{self.base_url}/get/{obj_id}",
+                timeout=self._timeout
+            )
+            if response.status_code == 200:
+                obj_data = response.json()
+                # /get/ returns object with 'common' key
+                name = obj_data.get('common', {}).get('name', '')
+                if isinstance(name, dict):
+                    name = name.get('de', name.get('en', str(name)))
+                if name:
+                    logger.debug(f"Gerätename für {uuid}: {name}")
+                    return name
+        except Exception as e:
+            logger.debug(f"Konnte Namen für {uuid} nicht abrufen: {e}")
+        return None
+    
+    def _load_alexa_devices(self) -> None:
+        """Load all devices from Alexa2 Smart-Home-Devices."""
+        try:
+            response = requests.get(
+                f"{self.base_url}/objects",
+                params={"pattern": f"{self.ALEXA_DEVICES_PREFIX}.*"},
+                timeout=self._timeout
+            )
+            if response.status_code != 200:
+                logger.warning(f"Fehler beim Abrufen der Alexa-Geräte: Status {response.status_code}")
+                return
+            
+            objects = response.json()
+            logger.debug(f"Alexa2 liefert {len(objects)} Objekte")
+            
+            # Collect all device UUIDs and their states
+            # Structure: alexa2.0.Smart-Home-Devices.{UUID}.{stateName}
+            device_states = {}  # UUID -> {state_name: obj_id}
+            device_names = {}   # UUID -> name (from folder/device object)
+            
+            for obj_id, obj_data in objects.items():
+                # Skip system states (deleteAll, discoverDevices)
+                if obj_id.endswith('.deleteAll') or obj_id.endswith('.discoverDevices'):
+                    continue
+                
+                # Extract UUID from path
+                parts = obj_id.split('.')
+                if len(parts) < 4:
+                    continue
+                
+                # alexa2.0.Smart-Home-Devices.UUID... 
+                uuid = parts[3]
+                
+                # Skip if UUID looks like a system state
+                if uuid in ['deleteAll', 'discoverDevices']:
+                    continue
+                
+                obj_type = obj_data.get('type', '')
+                common = obj_data.get('common', {})
+                
+                # If this is a folder or device object, get the name
+                if obj_type in ['folder', 'device', 'channel']:
+                    name = common.get('name', '')
+                    if isinstance(name, dict):
+                        name = name.get('de', name.get('en', str(name)))
+                    if name and uuid not in device_names:
+                        device_names[uuid] = name
+                
+                # If this is a state, collect it
+                if obj_type == 'state' and len(parts) >= 5:
+                    state_name = parts[4]  # e.g., powerState, rangeValue, etc.
+                    if uuid not in device_states:
+                        device_states[uuid] = {}
+                    device_states[uuid][state_name] = obj_id
+            
+            # Now build device list from collected data
+            for uuid, states in device_states.items():
+                # Get device name - try cached first, then fetch individually
+                name = device_names.get(uuid)
+                if not name:
+                    name = self._get_device_name(uuid)
+                if not name:
+                    name = uuid  # Fallback to UUID
+                
+                # Determine device type and relevant states
+                device_type = 'unknown'
+                blind_state = None
+                power_state = None
+                brightness_state = None
+                
+                # Check for blinds (Blind-Lift-rangeValue, percentage, etc.)
+                for state_name in ['Blind-Lift-rangeValue', 'rangeValue', 'percentage']:
+                    if state_name in states:
+                        device_type = 'blind'
+                        blind_state = states[state_name]
+                        break
+                
+                # Check for power state (powerState - lowercase!)
+                for state_name in ['powerState', 'Powerstate', 'power']:
+                    if state_name in states:
+                        if device_type == 'unknown':
+                            device_type = 'switch'
+                        power_state = states[state_name]
+                        break
+                
+                # Check for brightness
+                for state_name in ['brightness', 'Brightness', 'dimmer', 'level']:
+                    if state_name in states:
+                        device_type = 'dimmer'
+                        brightness_state = states[state_name]
+                        break
+                
+                if device_type != 'unknown':
+                    self._devices[name.lower()] = {
+                        'name': name,
+                        'id': f"{self.ALEXA_DEVICES_PREFIX}.{uuid}",
+                        'uuid': uuid,
+                        'type': device_type,
+                        'blind_state': blind_state,
+                        'power_state': power_state,
+                        'brightness_state': brightness_state,
+                        'all_states': states  # Keep all states for debugging
+                    }
+            
+            logger.info(f"✓ {len(self._devices)} Alexa Smart-Home Geräte geladen")
+            
+            # Log device types
+            blinds = [d['name'] for d in self._devices.values() if d['type'] == 'blind']
+            switches = [d['name'] for d in self._devices.values() if d['type'] in ['switch', 'dimmer']]
+            if blinds:
+                logger.info(f"  Rolladen: {', '.join(blinds[:5])}{'...' if len(blinds) > 5 else ''}")
+            if switches:
+                logger.info(f"  Lichter/Schalter: {', '.join(switches[:5])}{'...' if len(switches) > 5 else ''}")
+            
+            # Debug: log all found devices with their states
+            for name, device in self._devices.items():
+                logger.debug(f"  Gerät '{device['name']}' ({device['type']}): {list(device['all_states'].keys())}")
+            
+        except Exception as e:
+            logger.warning(f"Fehler beim Laden der Alexa-Geräte: {e}")
+    
+    def _find_device(self, device_name: str, device_type: Optional[str] = None) -> Optional[dict]:
+        """
+        Find a device by name (fuzzy match).
+        Returns device info dict or None.
+        """
+        device_name_lower = device_name.lower()
+        
+        # Direct match
+        if device_name_lower in self._devices:
+            device = self._devices[device_name_lower]
+            if device_type is None or device['type'] == device_type:
+                return device
+        
+        # Partial match
+        for name, device in self._devices.items():
+            if device_type and device['type'] != device_type:
+                continue
+            
+            # Check if search term is in device name or vice versa
+            if device_name_lower in name or name in device_name_lower:
+                logger.info(f"Gerät gefunden: {device['name']} ({device['type']})")
+                return device
+        
+        # Word-by-word match (for "Wohnzimmer Rollo" matching "Rollo Wohnzimmer")
+        search_words = device_name_lower.split()
+        for name, device in self._devices.items():
+            if device_type and device['type'] != device_type:
+                continue
+            
+            # Check if all search words are in the device name
+            if all(word in name for word in search_words):
+                logger.info(f"Gerät gefunden: {device['name']} ({device['type']})")
+                return device
+        
+        return None
     
     def initialize(self) -> None:
-        """Test connection to ioBroker."""
+        """Test connection to ioBroker and load Alexa devices."""
         try:
             response = requests.get(f"{self.base_url}/getPlainValue/system.adapter.admin.0.alive", timeout=self._timeout)
             if response.status_code == 200:
                 logger.info(f"✓ ioBroker verbunden: {self.base_url}")
+                # Load Alexa Smart-Home devices
+                self._load_alexa_devices()
             else:
                 logger.warning(f"ioBroker antwortet mit Status {response.status_code}")
         except requests.RequestException as e:
@@ -69,91 +255,6 @@ class SmartHomeTool:
             logger.error(f"Fehler beim Setzen von {object_id}: {e}")
             return False
     
-    def _find_device(self, device_name: str) -> list[dict]:
-        """
-        Search for devices by name in ioBroker.
-        Returns list of matching object IDs, prioritizing real devices over Alexa routines.
-        """
-        # Adapters to exclude (system stuff, not devices)
-        EXCLUDED_PREFIXES = [
-            'alexa2.0.History',
-            'alexa2.0.Echo-Devices.*.Routines',  # Exclude routines but not smart home
-            'system.',
-            'admin.',
-        ]
-        
-        # Patterns to exclude (more specific)
-        EXCLUDED_PATTERNS = [
-            '.Routines.',     # Alexa routines
-            '.Commands.',     # Alexa commands  
-            '.History.',      # History entries
-        ]
-        
-        # Preferred adapters for real devices (in priority order)
-        PREFERRED_PREFIXES = [
-            'alexa2.0.Smart-Home-Devices',  # Alexa Smart Home devices (preferred!)
-            'hue.',           # Philips Hue
-            'shelly.',        # Shelly devices
-            'zigbee.',        # Zigbee devices
-            'zigbee2mqtt.',   # Zigbee2MQTT
-            'deconz.',        # deCONZ/Phoscon
-            'tradfri.',       # IKEA Tradfri
-            'mqtt.',          # Generic MQTT
-            'sonoff.',        # Sonoff/Tasmota
-            'homematic.',     # HomeMatic
-            'iot.',           # IoT adapter
-            'linkeddevices.', # Linked devices
-            'alias.',         # Aliases (user-defined)
-            'alexa2.0.',      # Other Alexa devices (fallback)
-        ]
-        
-        try:
-            response = requests.get(f"{self.base_url}/objects", timeout=self._timeout)
-            if response.status_code != 200:
-                return []
-            
-            objects = response.json()
-            matches = []
-            device_name_lower = device_name.lower()
-            
-            for obj_id, obj_data in objects.items():
-                # Skip excluded adapters
-                if any(obj_id.startswith(prefix) for prefix in EXCLUDED_PREFIXES):
-                    continue
-                
-                # Skip excluded patterns (routines, commands, history)
-                if any(pattern in obj_id for pattern in EXCLUDED_PATTERNS):
-                    continue
-                
-                if 'common' in obj_data and 'name' in obj_data['common']:
-                    name = obj_data['common']['name']
-                    if isinstance(name, dict):
-                        name = name.get('de', name.get('en', ''))
-                    
-                    if device_name_lower in str(name).lower():
-                        # Calculate priority (lower = better)
-                        priority = 100
-                        for i, prefix in enumerate(PREFERRED_PREFIXES):
-                            if obj_id.startswith(prefix):
-                                priority = i
-                                break
-                        
-                        matches.append({
-                            'id': obj_id,
-                            'name': name,
-                            'type': obj_data.get('type', 'unknown'),
-                            'role': obj_data.get('common', {}).get('role', 'unknown'),
-                            'priority': priority
-                        })
-            
-            # Sort by priority (preferred adapters first)
-            matches.sort(key=lambda x: x['priority'])
-            
-            return matches
-        except Exception as e:
-            logger.error(f"Fehler bei Gerätesuche: {e}")
-            return []
-    
     # === Tool Functions for Gemini ===
     
     def turn_on_device(self, device_name: str) -> str:
@@ -168,20 +269,16 @@ class SmartHomeTool:
         """
         logger.info(f"Schalte '{device_name}' ein...")
         
-        matches = self._find_device(device_name)
-        if not matches:
-            return f"Gerät '{device_name}' nicht gefunden. Bitte prüfe den Namen."
+        device = self._find_device(device_name)
+        if not device:
+            return f"Gerät '{device_name}' nicht gefunden."
         
-        # Find switchable state
-        for match in matches:
-            obj_id = match['id']
-            # Try common patterns for on/off states
-            for suffix in ['', '.state', '.STATE', '.on', '.ON', '.switch', '.SWITCH']:
-                state_id = obj_id + suffix if suffix else obj_id
-                if self._set_state(state_id, True):
-                    return f"'{match['name']}' wurde eingeschaltet."
+        # Use Powerstate for lights/switches
+        if device.get('power_state'):
+            if self._set_state(device['power_state'], True):
+                return f"'{device['name']}' wurde eingeschaltet."
         
-        return f"Konnte '{device_name}' nicht einschalten. Gerät gefunden aber nicht schaltbar."
+        return f"Konnte '{device_name}' nicht einschalten."
     
     def turn_off_device(self, device_name: str) -> str:
         """
@@ -195,16 +292,14 @@ class SmartHomeTool:
         """
         logger.info(f"Schalte '{device_name}' aus...")
         
-        matches = self._find_device(device_name)
-        if not matches:
-            return f"Gerät '{device_name}' nicht gefunden. Bitte prüfe den Namen."
+        device = self._find_device(device_name)
+        if not device:
+            return f"Gerät '{device_name}' nicht gefunden."
         
-        for match in matches:
-            obj_id = match['id']
-            for suffix in ['', '.state', '.STATE', '.on', '.ON', '.switch', '.SWITCH']:
-                state_id = obj_id + suffix if suffix else obj_id
-                if self._set_state(state_id, False):
-                    return f"'{match['name']}' wurde ausgeschaltet."
+        # Use Powerstate for lights/switches
+        if device.get('power_state'):
+            if self._set_state(device['power_state'], False):
+                return f"'{device['name']}' wurde ausgeschaltet."
         
         return f"Konnte '{device_name}' nicht ausschalten."
     
@@ -223,16 +318,14 @@ class SmartHomeTool:
         
         brightness = max(0, min(100, brightness))
         
-        matches = self._find_device(device_name)
-        if not matches:
+        device = self._find_device(device_name)
+        if not device:
             return f"Gerät '{device_name}' nicht gefunden."
         
-        for match in matches:
-            obj_id = match['id']
-            for suffix in ['.brightness', '.BRIGHTNESS', '.level', '.LEVEL', '.dimmer', '.DIMMER']:
-                state_id = obj_id + suffix
-                if self._set_state(state_id, brightness):
-                    return f"Helligkeit von '{match['name']}' auf {brightness}% gesetzt."
+        # Use brightness state if available
+        if device.get('brightness_state'):
+            if self._set_state(device['brightness_state'], brightness):
+                return f"Helligkeit von '{device['name']}' auf {brightness}% gesetzt."
         
         return f"Konnte Helligkeit von '{device_name}' nicht setzen. Gerät nicht dimmbar?"
     
@@ -293,6 +386,18 @@ class SmartHomeTool:
         
         temperature = max(5, min(30, temperature))
         
+        # First try room+function based search
+        matches = self._find_device_by_room_and_function(device_name, 'thermostat')
+        
+        if matches:
+            for match in matches:
+                obj_id = match['id']
+                for suffix in ['.setpoint', '.SETPOINT', '.target', '.TARGET', '.set_temperature', '']:
+                    state_id = obj_id + suffix if suffix else obj_id
+                    if self._set_state(state_id, temperature):
+                        return f"Temperatur von '{match.get('name', device_name)}' auf {temperature}°C gesetzt."
+        
+        # Fallback to general search
         matches = self._find_device(device_name)
         if not matches:
             return f"Thermostat '{device_name}' nicht gefunden."
@@ -351,17 +456,20 @@ class SmartHomeTool:
         
         position = max(0, min(100, position))
         
-        matches = self._find_device(device_name)
-        if not matches:
+        # Find blind device
+        device = self._find_device(device_name, device_type='blind')
+        if not device:
+            # Try without type filter
+            device = self._find_device(device_name)
+        
+        if not device:
             return f"Rollo '{device_name}' nicht gefunden."
         
-        for match in matches:
-            obj_id = match['id']
-            for suffix in ['.level', '.LEVEL', '.position', '.POSITION', '']:
-                state_id = obj_id + suffix if suffix else obj_id
-                if self._set_state(state_id, position):
-                    status = "geschlossen" if position == 0 else "geöffnet" if position == 100 else f"auf {position}%"
-                    return f"Rollo '{match['name']}' {status}."
+        # Use Blind-Lift-rangeValue for Alexa blinds
+        if device.get('blind_state'):
+            if self._set_state(device['blind_state'], position):
+                status = "geschlossen" if position == 0 else "geöffnet" if position == 100 else f"auf {position}%"
+                return f"Rollo '{device['name']}' {status}."
         
         return f"Konnte Rollo '{device_name}' nicht steuern."
     
@@ -370,60 +478,24 @@ class SmartHomeTool:
         List all available smart home devices.
         
         Returns:
-            List of device names and types
+            List of device names by type
         """
         logger.info("Liste alle Smart Home Geräte auf...")
         
-        # Patterns to exclude
-        EXCLUDED_PATTERNS = ['.Routines.', '.Commands.', '.History.', 'system.', 'admin.']
+        if not self._devices:
+            return "Keine Smart Home Geräte gefunden."
         
-        # Patterns that indicate controllable devices
-        DEVICE_INDICATORS = [
-            'Smart-Home-Devices',  # Alexa Smart Home
-            '.on', '.ON',          # On/off states
-            '.state', '.STATE',
-            '.switch', '.SWITCH',
-            '.brightness', '.BRIGHTNESS',
-            '.level', '.LEVEL',
-        ]
+        # Group by type
+        blinds = [d['name'] for d in self._devices.values() if d['type'] == 'blind']
+        lights = [d['name'] for d in self._devices.values() if d['type'] in ['switch', 'dimmer']]
         
-        try:
-            response = requests.get(f"{self.base_url}/objects", timeout=self._timeout)
-            if response.status_code != 200:
-                return "Konnte Geräteliste nicht abrufen."
-            
-            objects = response.json()
-            device_names = set()  # Use set to avoid duplicates
-            
-            for obj_id, obj_data in objects.items():
-                # Skip excluded patterns
-                if any(pattern in obj_id for pattern in EXCLUDED_PATTERNS):
-                    continue
-                
-                # Check if it's a device-like object
-                obj_type = obj_data.get('type', '')
-                is_device = obj_type in ['device', 'channel']
-                has_indicator = any(ind in obj_id for ind in DEVICE_INDICATORS)
-                
-                if is_device or has_indicator:
-                    if 'common' in obj_data and 'name' in obj_data['common']:
-                        name = obj_data['common']['name']
-                        if isinstance(name, dict):
-                            name = name.get('de', name.get('en', ''))
-                        if name and len(name) > 1:
-                            device_names.add(str(name))
-            
-            if device_names:
-                # Sort and limit
-                sorted_names = sorted(device_names)[:25]
-                device_list = ", ".join(sorted_names)
-                return f"Verfügbare Geräte: {device_list}"
-            else:
-                return "Keine Geräte gefunden. Prüfe ob ioBroker Geräte hat."
-                
-        except Exception as e:
-            logger.error(f"Fehler beim Auflisten: {e}")
-            return "Fehler beim Abrufen der Geräteliste."
+        result_parts = []
+        if blinds:
+            result_parts.append(f"Rolladen: {', '.join(blinds[:10])}")
+        if lights:
+            result_parts.append(f"Lichter/Schalter: {', '.join(lights[:10])}")
+        
+        return ". ".join(result_parts) if result_parts else "Keine steuerbaren Geräte gefunden."
     
     def execute_scene(self, scene_name: str) -> str:
         """

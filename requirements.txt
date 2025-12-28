@@ -9,7 +9,8 @@ pyaudio==0.2.14
 sounddevice==0.4.6
 numpy==1.26.4
 
-# Gemini Live API (WebSocket)
+# Gemini Live API (Official SDK)
+google-genai>=1.0.0
 websockets==12.0
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
@@ -32,3 +33,6 @@ psutil>=5.9.0
 
 # Logging
 colorlog==6.8.2
+
+# YAML parsing (for device mapping)
+pyyaml>=6.0

@@ -33,9 +33,8 @@ class PorcupineConfig(BaseSettings):
 class GeminiConfig(BaseSettings):
     """Gemini Live API configuration."""
     api_key: str = Field(alias="GEMINI_API_KEY")
-    model: str = "gemini-2.5-flash-native-audio-preview-12-2025"  # Native audio model for Live API
-    # WebSocket endpoint for Gemini Live API
-    ws_url: str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    # Native audio model for Live API
+    model: str = "gemini-2.5-flash-native-audio-preview-12-2025"
     
     # Audio format settings (required by Gemini)
     input_sample_rate: int = 16000
