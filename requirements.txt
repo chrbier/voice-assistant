@@ -11,7 +11,7 @@ numpy==1.26.4
 
 # Gemini Live API (Official SDK)
 google-genai>=1.0.0
-websockets==12.0
+websockets>=13.0.0
 
 # Google Auth & Calendar API (versions loosened for compatibility)
 google-auth>=2.15.0
@@ -21,8 +21,8 @@ google-auth-httplib2>=0.1.0
 
 # Configuration
 python-dotenv==1.0.1
-pydantic==2.7.1
-pydantic-settings==2.2.1
+pydantic>=2.9.0
+pydantic-settings>=2.2.0
 
 # Audio utilities
 scipy==1.13.0
