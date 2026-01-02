@@ -7,6 +7,7 @@ import asyncio
 import logging
 from typing import AsyncGenerator, Optional, Callable
 import numpy as np
+from scipy.signal import resample
 
 try:
     import sounddevice as sd
@@ -27,7 +28,7 @@ class AudioHandler:
     """
     
     def __init__(self):
-        self.sample_rate = config.audio.sample_rate
+        self.target_sample_rate = config.audio.sample_rate  # What Gemini expects (16000 Hz)
         self.channels = config.audio.channels
         self.chunk_size = config.audio.chunk_size
         self._stream = None
@@ -35,6 +36,33 @@ class AudioHandler:
         self._audio_queue: asyncio.Queue = None
         self._use_sounddevice = sd is not None
         self._pyaudio_instance = None
+        
+        # Check what sample rate the microphone actually supports
+        self.actual_sample_rate, self._needs_resampling = self._check_supported_sample_rate()
+        if self._needs_resampling:
+            # Adjust chunk size for higher sample rate
+            self._resample_ratio = self.actual_sample_rate / self.target_sample_rate
+            self.actual_chunk_size = int(self.chunk_size * self._resample_ratio)
+            logger.info(f"Audio-Handler: Mikrofon bei {self.actual_sample_rate} Hz, Resampling auf {self.target_sample_rate} Hz")
+        else:
+            self.actual_chunk_size = self.chunk_size
+            self.actual_sample_rate = self.target_sample_rate
+    
+    def _check_supported_sample_rate(self) -> tuple[int, bool]:
+        """Check if target sample rate is supported, return (actual_rate, needs_resampling)."""
+        if self._use_sounddevice and sd is not None:
+            try:
+                sd.check_input_settings(samplerate=self.target_sample_rate)
+                return self.target_sample_rate, False
+            except Exception:
+                # Try common rates that might be supported
+                for rate in [48000, 44100]:
+                    try:
+                        sd.check_input_settings(samplerate=rate)
+                        return rate, True
+                    except Exception:
+                        continue
+        return self.target_sample_rate, False
         
     def _get_device_index(self, device_name: str) -> Optional[int]:
         """Get device index by name or return None for default."""
@@ -100,8 +128,13 @@ class AudioHandler:
                 logger.warning(f"Audio status: {status}")
             if self._is_recording and self._audio_queue:
                 try:
-                    # Convert to bytes for streaming
-                    audio_bytes = indata.tobytes()
+                    # Resample if needed
+                    if self._needs_resampling:
+                        audio_float = indata.flatten().astype(np.float32)
+                        resampled = resample(audio_float, self.chunk_size)
+                        audio_bytes = resampled.astype(np.int16).tobytes()
+                    else:
+                        audio_bytes = indata.tobytes()
                     self._audio_queue.put_nowait(audio_bytes)
                 except asyncio.QueueFull:
                     # Only log occasionally to avoid spam
@@ -111,10 +144,10 @@ class AudioHandler:
         
         if self._use_sounddevice:
             self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
+                samplerate=self.actual_sample_rate,
                 channels=self.channels,
                 dtype=np.int16,
-                blocksize=self.chunk_size,
+                blocksize=self.actual_chunk_size,
                 device=self._get_device_index(config.audio.input_device),
                 callback=audio_callback
             )
@@ -128,15 +161,21 @@ class AudioHandler:
                 stream = p.open(
                     format=pyaudio.paInt16,
                     channels=self.channels,
-                    rate=self.sample_rate,
+                    rate=self.actual_sample_rate,
                     input=True,
-                    frames_per_buffer=self.chunk_size,
+                    frames_per_buffer=self.actual_chunk_size,
                     input_device_index=self._get_device_index(config.audio.input_device)
                 )
                 
                 while self._is_recording:
                     try:
-                        data = stream.read(self.chunk_size, exception_on_overflow=False)
+                        data = stream.read(self.actual_chunk_size, exception_on_overflow=False)
+                        # Resample if needed
+                        if self._needs_resampling:
+                            audio_frame = np.frombuffer(data, dtype=np.int16)
+                            audio_float = audio_frame.astype(np.float32)
+                            resampled = resample(audio_float, self.chunk_size)
+                            data = resampled.astype(np.int16).tobytes()
                         if self._audio_queue:
                             asyncio.run_coroutine_threadsafe(
                                 self._audio_queue.put(data),
