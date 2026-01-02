@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 import numpy as np
+from scipy.signal import resample
 
 try:
     import sounddevice as sd
@@ -31,7 +32,7 @@ class AudioPlayer:
     """
     
     def __init__(self):
-        self.sample_rate = config.gemini.output_sample_rate  # 24kHz
+        self.target_sample_rate = config.gemini.output_sample_rate  # 24kHz from Gemini
         self.channels = 1
         self._is_playing = False
         self._playback_thread: Optional[threading.Thread] = None
@@ -47,6 +48,32 @@ class AudioPlayer:
         
         # Chunk size for playback (samples per write)
         self._chunk_samples = 1200  # 50ms chunks
+        
+        # Check what sample rate the speaker actually supports
+        self.actual_sample_rate, self._needs_resampling = self._check_supported_output_rate()
+        if self._needs_resampling:
+            self._resample_ratio = self.actual_sample_rate / self.target_sample_rate
+            self._actual_chunk_samples = int(self._chunk_samples * self._resample_ratio)
+            logger.info(f"Audio-Player: Lautsprecher bei {self.actual_sample_rate} Hz, Resampling von {self.target_sample_rate} Hz")
+        else:
+            self.actual_sample_rate = self.target_sample_rate
+            self._actual_chunk_samples = self._chunk_samples
+    
+    def _check_supported_output_rate(self) -> tuple[int, bool]:
+        """Check if target sample rate is supported for output, return (actual_rate, needs_resampling)."""
+        if _use_sounddevice and sd is not None:
+            try:
+                sd.check_output_settings(samplerate=self.target_sample_rate)
+                return self.target_sample_rate, False
+            except Exception:
+                # Try common rates that might be supported
+                for rate in [48000, 44100]:
+                    try:
+                        sd.check_output_settings(samplerate=rate)
+                        return rate, True
+                    except Exception:
+                        continue
+        return self.target_sample_rate, False
         
     def _get_device_index(self, device_name: str) -> Optional[int]:
         """Get output device index by name."""
@@ -86,6 +113,13 @@ class AudioPlayer:
                 if ch == 2:
                     arr = arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
                 
+                # Resample to supported rate if needed
+                if sr != self.actual_sample_rate:
+                    target_samples = int(len(arr) * self.actual_sample_rate / sr)
+                    arr_float = arr.astype(np.float32)
+                    arr = resample(arr_float, target_samples).astype(np.int16)
+                    sr = self.actual_sample_rate
+                
                 if _use_sounddevice:
                     sd.play(arr, sr, device=self._get_device_index(config.audio.output_device))
                     sd.wait()
@@ -103,18 +137,23 @@ class AudioPlayer:
     
     def _play_beep(self, freq: int = 800, dur: float = 0.15) -> None:
         """Play a simple beep."""
-        t = np.linspace(0, dur, int(24000 * dur), False)
+        # Use actual supported sample rate
+        sr = self.actual_sample_rate if self.actual_sample_rate else 48000
+        t = np.linspace(0, dur, int(sr * dur), False)
         tone = (np.sin(2 * np.pi * freq * t) * 16000).astype(np.int16)
-        if _use_sounddevice:
-            sd.play(tone, 24000)
-            sd.wait()
-        else:
-            p = pyaudio.PyAudio()
-            s = p.open(format=pyaudio.paInt16, channels=1, rate=24000, output=True)
-            s.write(tone.tobytes())
-            s.stop_stream()
-            s.close()
-            p.terminate()
+        try:
+            if _use_sounddevice:
+                sd.play(tone, sr)
+                sd.wait()
+            else:
+                p = pyaudio.PyAudio()
+                s = p.open(format=pyaudio.paInt16, channels=1, rate=sr, output=True)
+                s.write(tone.tobytes())
+                s.stop_stream()
+                s.close()
+                p.terminate()
+        except Exception as e:
+            logger.debug(f"Beep fehlgeschlagen: {e}")
     
     def play_activation_sound(self) -> None:
         """Play wakeword activation sound."""
@@ -148,18 +187,23 @@ class AudioPlayer:
         """Sounddevice playback."""
         try:
             with sd.OutputStream(
-                samplerate=self.sample_rate,
+                samplerate=self.actual_sample_rate,
                 channels=1,
                 dtype=np.int16,
-                blocksize=self._chunk_samples,
+                blocksize=self._actual_chunk_samples,
                 device=self._get_device_index(config.audio.output_device)
             ) as stream:
                 while self._is_playing:
                     chunk = self._get_samples(self._chunk_samples)
                     if chunk is not None and len(chunk) > 0:
+                        # Resample if needed (e.g., 24kHz -> 48kHz)
+                        if self._needs_resampling:
+                            chunk_float = chunk.astype(np.float32)
+                            resampled = resample(chunk_float, self._actual_chunk_samples)
+                            chunk = resampled.astype(np.int16)
                         # Pad if needed
-                        if len(chunk) < self._chunk_samples:
-                            chunk = np.pad(chunk, (0, self._chunk_samples - len(chunk)))
+                        if len(chunk) < self._actual_chunk_samples:
+                            chunk = np.pad(chunk, (0, self._actual_chunk_samples - len(chunk)))
                         stream.write(chunk.reshape(-1, 1))
                     else:
                         time.sleep(0.01)
@@ -173,15 +217,20 @@ class AudioPlayer:
             stream = p.open(
                 format=pyaudio.paInt16,
                 channels=1,
-                rate=self.sample_rate,
+                rate=self.actual_sample_rate,
                 output=True,
-                frames_per_buffer=self._chunk_samples,
+                frames_per_buffer=self._actual_chunk_samples,
                 output_device_index=self._get_device_index(config.audio.output_device)
             )
             
             while self._is_playing:
                 chunk = self._get_samples(self._chunk_samples)
                 if chunk is not None and len(chunk) > 0:
+                    # Resample if needed (e.g., 24kHz -> 48kHz)
+                    if self._needs_resampling:
+                        chunk_float = chunk.astype(np.float32)
+                        resampled = resample(chunk_float, self._actual_chunk_samples)
+                        chunk = resampled.astype(np.int16)
                     stream.write(chunk.tobytes())
                 else:
                     time.sleep(0.01)
