@@ -12,12 +12,12 @@ numpy==1.26.4
 # Gemini Live API (Official SDK)
 google-genai>=1.0.0
 websockets==12.0
-google-auth==2.29.0
-google-auth-oauthlib==1.2.0
 
-# Google Calendar API
-google-api-python-client==2.126.0
-google-auth-httplib2==0.2.0
+# Google Auth & Calendar API (versions loosened for compatibility)
+google-auth>=2.15.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.0
 
 # Configuration
 python-dotenv==1.0.1
@@ -36,3 +36,6 @@ colorlog==6.8.2
 
 # YAML parsing (for device mapping)
 pyyaml>=6.0
+
+# Memory/Vector DB
+chromadb>=0.4.22

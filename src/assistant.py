@@ -29,6 +29,7 @@ from src.tools.timer import TimerTool
 from src.tools.weather import WeatherTool
 from src.tools.news import NewsTool
 from src.tools.websearch import WebSearchTool
+from src.tools.memory import MemoryTool
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class VoiceAssistant:
         self._weather_tool: Optional[WeatherTool] = None
         self._news_tool: Optional[NewsTool] = None
         self._websearch_tool: Optional[WebSearchTool] = None
+        self._memory_tool: Optional[MemoryTool] = None
         
         self._is_running = False
         self._is_in_conversation = False
@@ -145,6 +147,15 @@ class VoiceAssistant:
         except Exception as e:
             logger.warning(f"Web-Recherche nicht verfügbar: {e}")
             self._websearch_tool = None
+        
+        # Initialize Memory tool (ChromaDB)
+        self._memory_tool = MemoryTool()
+        try:
+            self._memory_tool.initialize()
+            logger.info("✓ Gedächtnis verfügbar")
+        except Exception as e:
+            logger.warning(f"Gedächtnis nicht verfügbar: {e}")
+            self._memory_tool = None
         
         # Register all available tools
         self._register_tools()
@@ -244,6 +255,19 @@ class VoiceAssistant:
         if self._websearch_tool:
             for tool_def in self._websearch_tool.get_tool_definitions():
                 handler = self._websearch_tool.get_tool_handlers().get(tool_def["name"])
+                if handler:
+                    self._gemini_client.register_tool(
+                        name=tool_def["name"],
+                        description=tool_def["description"],
+                        parameters=tool_def["parameters"],
+                        handler=handler
+                    )
+                    tools_registered += 1
+        
+        # Register Memory tools
+        if self._memory_tool:
+            for tool_def in self._memory_tool.get_tool_definitions():
+                handler = self._memory_tool.get_tool_handlers().get(tool_def["name"])
                 if handler:
                     self._gemini_client.register_tool(
                         name=tool_def["name"],
