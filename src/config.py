@@ -43,6 +43,7 @@ class GeminiConfig(BaseSettings):
 
 class GoogleCalendarConfig(BaseSettings):
     """Google Calendar API configuration."""
+    enabled: bool = Field(default=True, alias="GOOGLE_CALENDAR_ENABLED")
     credentials_file: str = Field(default="credentials.json", alias="GOOGLE_CREDENTIALS_FILE")
     token_file: str = "token.json"
     scopes: list[str] = [

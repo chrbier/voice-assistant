@@ -82,7 +82,7 @@ class VoiceAssistant:
         self._gemini_client = GeminiLiveClient()
         
         # Initialize calendar tool (optional)
-        if config.has_calendar_credentials():
+        if config.calendar.enabled and config.has_calendar_credentials():
             self._calendar_tool = GoogleCalendarTool()
             try:
                 self._calendar_tool.initialize()
@@ -90,6 +90,8 @@ class VoiceAssistant:
             except Exception as e:
                 logger.warning(f"Google Calendar nicht verfügbar: {e}")
                 self._calendar_tool = None
+        elif not config.calendar.enabled:
+            logger.info("ℹ️  Google Calendar deaktiviert (GOOGLE_CALENDAR_ENABLED=false)")
         else:
             logger.info("ℹ️  Starte ohne Google Calendar (credentials.json nicht gefunden)")
         

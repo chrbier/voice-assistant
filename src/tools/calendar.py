@@ -189,8 +189,16 @@ class GoogleCalendarTool:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 logger.info("Aktualisiere Google-Token...")
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except Exception as refresh_error:
+                    logger.warning(f"Token-Refresh fehlgeschlagen: {refresh_error}")
+                    # Delete invalid token and re-authenticate
+                    if token_path.exists():
+                        token_path.unlink()
+                    creds = None
+            
+            if not creds:
                 if not credentials_path.exists():
                     raise FileNotFoundError(
                         f"Google Credentials nicht gefunden: {credentials_path}\n"
@@ -202,7 +210,28 @@ class GoogleCalendarTool:
                     str(credentials_path),
                     config.calendar.scopes
                 )
-                creds = flow.run_local_server(port=0)
+                
+                # Try local server first, fall back to console for headless systems
+                try:
+                    creds = flow.run_local_server(port=0)
+                except Exception:
+                    # Headless mode: show URL for manual authentication
+                    logger.info("Kein Browser verfügbar - nutze Console-Authentifizierung")
+                    print("\n" + "="*60)
+                    print("GOOGLE CALENDAR AUTHENTIFIZIERUNG")
+                    print("="*60)
+                    print("Öffne diese URL in einem Browser (z.B. auf deinem PC/Handy):")
+                    print()
+                    auth_url, _ = flow.authorization_url(prompt='consent')
+                    print(auth_url)
+                    print()
+                    print("Nach der Anmeldung wirst du zu einer Seite weitergeleitet.")
+                    print("Kopiere den 'code' Parameter aus der URL und füge ihn hier ein:")
+                    print("(Die URL sieht aus wie: http://localhost/?code=XXXXX&scope=...)")
+                    print("="*60)
+                    code = input("Authorization Code eingeben: ").strip()
+                    flow.fetch_token(code=code)
+                    creds = flow.credentials
             
             # Save token for future use
             with open(token_path, "w") as token_file:
