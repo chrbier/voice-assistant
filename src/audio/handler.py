@@ -37,16 +37,12 @@ class AudioHandler:
         self._use_sounddevice = sd is not None
         self._pyaudio_instance = None
         
-        # Check what sample rate the microphone actually supports
-        self.actual_sample_rate, self._needs_resampling = self._check_supported_sample_rate()
-        if self._needs_resampling:
-            # Adjust chunk size for higher sample rate
-            self._resample_ratio = self.actual_sample_rate / self.target_sample_rate
-            self.actual_chunk_size = int(self.chunk_size * self._resample_ratio)
-            logger.info(f"Audio-Handler: Mikrofon bei {self.actual_sample_rate} Hz, Resampling auf {self.target_sample_rate} Hz")
-        else:
-            self.actual_chunk_size = self.chunk_size
-            self.actual_sample_rate = self.target_sample_rate
+        # Don't check sample rate here - defer to start_streaming()
+        # This avoids conflicts with wakeword detection
+        self.actual_sample_rate = None
+        self.actual_chunk_size = None
+        self._needs_resampling = False
+        self._sample_rate_checked = False
     
     def _check_supported_sample_rate(self) -> tuple[int, bool]:
         """Check if target sample rate is supported, return (actual_rate, needs_resampling)."""
@@ -119,13 +115,33 @@ class AudioHandler:
     
     async def start_streaming(self) -> None:
         """Start async audio streaming."""
+        # Check sample rate on first use (deferred from __init__ to avoid wakeword conflicts)
+        if not self._sample_rate_checked:
+            self.actual_sample_rate, self._needs_resampling = self._check_supported_sample_rate()
+            if self._needs_resampling:
+                self._resample_ratio = self.actual_sample_rate / self.target_sample_rate
+                self.actual_chunk_size = int(self.chunk_size * self._resample_ratio)
+                logger.info(f"Audio-Handler: Mikrofon bei {self.actual_sample_rate} Hz, Resampling auf {self.target_sample_rate} Hz")
+            else:
+                self.actual_chunk_size = self.chunk_size
+                self.actual_sample_rate = self.target_sample_rate
+            self._sample_rate_checked = True
+        
         self._audio_queue = asyncio.Queue(maxsize=500)  # Larger queue
         self._is_recording = True
         self._queue_full_count = 0  # Track dropped frames
         
+        self._overflow_count = 0
+        
         def audio_callback(indata, frames, time, status):
             if status:
-                logger.warning(f"Audio status: {status}")
+                # Only log overflow occasionally to avoid spam
+                if 'overflow' in str(status).lower():
+                    self._overflow_count += 1
+                    if self._overflow_count == 1 or self._overflow_count % 50 == 0:
+                        logger.debug(f"Audio input overflow (#{self._overflow_count}) - normal beim Resampling")
+                else:
+                    logger.warning(f"Audio status: {status}")
             if self._is_recording and self._audio_queue:
                 try:
                     # Resample if needed

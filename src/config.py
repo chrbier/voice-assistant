@@ -27,7 +27,7 @@ class PorcupineConfig(BaseSettings):
     """Porcupine wakeword configuration."""
     access_key: str = Field(alias="PORCUPINE_ACCESS_KEY")
     keyword: str = "computer"  # Built-in keyword
-    sensitivity: float = 0.5  # 0.0 to 1.0, higher = more sensitive
+    sensitivity: float = Field(default=0.7, alias="PORCUPINE_SENSITIVITY")  # 0.0 to 1.0, higher = more sensitive
 
 
 class GeminiConfig(BaseSettings):
