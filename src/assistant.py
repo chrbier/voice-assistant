@@ -315,23 +315,53 @@ class VoiceAssistant:
         logger.debug("Gemini Turn abgeschlossen")
         self._last_activity_time = datetime.now()
     
+    def _check_supported_sample_rate(self, target_rate: int) -> tuple[int, bool]:
+        """Check if target sample rate is supported, return (actual_rate, needs_resampling)."""
+        if _use_sounddevice:
+            try:
+                sd.check_input_settings(samplerate=target_rate)
+                return target_rate, False
+            except Exception:
+                # Try common rates that might be supported
+                for rate in [48000, 44100]:
+                    try:
+                        sd.check_input_settings(samplerate=rate)
+                        logger.info(f"Mikrofon unterstützt {target_rate} Hz nicht, verwende {rate} Hz mit Resampling")
+                        return rate, True
+                    except Exception:
+                        continue
+        return target_rate, False
+    
     async def _wakeword_loop(self) -> None:
         """Main loop for wakeword detection."""
+        from scipy.signal import resample
+        
         self._wakeword_detector.start()
         
         # Get Porcupine's required frame length and sample rate
         frame_length = self._wakeword_detector.frame_length
-        sample_rate = self._wakeword_detector.sample_rate
+        target_sample_rate = self._wakeword_detector.sample_rate  # Usually 16000 Hz
         
-        logger.debug(f"Wakeword-Loop: frame_length={frame_length}, sample_rate={sample_rate}")
+        # Check if we need resampling
+        actual_sample_rate, needs_resampling = self._check_supported_sample_rate(target_sample_rate)
+        
+        if needs_resampling:
+            # Calculate how many samples to read at the higher rate
+            resample_ratio = actual_sample_rate / target_sample_rate
+            actual_frame_length = int(frame_length * resample_ratio)
+            logger.debug(f"Resampling: {actual_sample_rate} Hz -> {target_sample_rate} Hz, frame: {actual_frame_length} -> {frame_length}")
+        else:
+            actual_frame_length = frame_length
+        
+        logger.debug(f"Wakeword-Loop: frame_length={frame_length}, sample_rate={target_sample_rate}, actual_rate={actual_sample_rate}")
         
         # Set up dedicated audio stream for wakeword detection
         if _use_sounddevice:
             stream = sd.InputStream(
-                samplerate=sample_rate,
+                samplerate=actual_sample_rate,
                 channels=1,
                 dtype=np.int16,
-                blocksize=frame_length
+                blocksize=actual_frame_length
             )
             stream.start()
         else:
@@ -339,21 +369,28 @@ class VoiceAssistant:
             stream = p.open(
                 format=pyaudio.paInt16,
                 channels=1,
-                rate=sample_rate,
+                rate=actual_sample_rate,
                 input=True,
-                frames_per_buffer=frame_length
+                frames_per_buffer=actual_frame_length
             )
         
         try:
             while self._is_running and not self._is_in_conversation:
                 try:
-                    # Read audio frame with correct size for Porcupine
+                    # Read audio frame
                     if _use_sounddevice:
-                        audio_data, overflowed = stream.read(frame_length)
+                        audio_data, overflowed = stream.read(actual_frame_length)
                         audio_frame = audio_data.flatten()
                     else:
-                        data = stream.read(frame_length, exception_on_overflow=False)
+                        data = stream.read(actual_frame_length, exception_on_overflow=False)
                         audio_frame = np.frombuffer(data, dtype=np.int16)
+                    
+                    # Resample if needed (e.g., 48000 Hz -> 16000 Hz)
+                    if needs_resampling:
+                        # Convert to float for resampling
+                        audio_float = audio_frame.astype(np.float32)
+                        resampled = resample(audio_float, frame_length)
+                        audio_frame = resampled.astype(np.int16)
                     
                     # Check for wakeword
                     if self._wakeword_detector.process_frame(audio_frame):
