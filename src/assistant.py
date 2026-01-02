@@ -375,7 +375,12 @@ class VoiceAssistant:
             )
         
         try:
-            while self._is_running and not self._is_in_conversation:
+            while self._is_running:
+                # Skip wakeword detection while in conversation
+                if self._is_in_conversation:
+                    await asyncio.sleep(0.1)
+                    continue
+                    
                 try:
                     # Read audio frame
                     if _use_sounddevice:
@@ -394,7 +399,36 @@ class VoiceAssistant:
                     
                     # Check for wakeword
                     if self._wakeword_detector.process_frame(audio_frame):
+                        # Close stream BEFORE starting conversation to free the microphone
+                        if _use_sounddevice:
+                            stream.stop()
+                            stream.close()
+                        else:
+                            stream.stop_stream()
+                            stream.close()
+                            p.terminate()
+                        
+                        # Start conversation (microphone is now free)
                         await self._start_conversation()
+                        
+                        # Re-open stream after conversation ends
+                        if _use_sounddevice:
+                            stream = sd.InputStream(
+                                samplerate=actual_sample_rate,
+                                channels=1,
+                                dtype=np.int16,
+                                blocksize=actual_frame_length
+                            )
+                            stream.start()
+                        else:
+                            p = pyaudio.PyAudio()
+                            stream = p.open(
+                                format=pyaudio.paInt16,
+                                channels=1,
+                                rate=actual_sample_rate,
+                                input=True,
+                                frames_per_buffer=actual_frame_length
+                            )
                     
                     # Small yield to allow other async tasks
                     await asyncio.sleep(0.001)
@@ -404,13 +438,16 @@ class VoiceAssistant:
                     await asyncio.sleep(0.1)
         finally:
             # Clean up audio stream
-            if _use_sounddevice:
-                stream.stop()
-                stream.close()
-            else:
-                stream.stop_stream()
-                stream.close()
-                p.terminate()
+            try:
+                if _use_sounddevice:
+                    stream.stop()
+                    stream.close()
+                else:
+                    stream.stop_stream()
+                    stream.close()
+                    p.terminate()
+            except Exception:
+                pass  # Stream might already be closed
     
     async def _start_conversation(self) -> None:
         """Start a conversation session after wakeword detection."""
