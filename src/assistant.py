@@ -299,6 +299,9 @@ class VoiceAssistant:
     
     def _on_gemini_audio(self, audio_data: bytes) -> None:
         """Handle audio response from Gemini."""
+        # Mute microphone to prevent self-hearing (echo)
+        self._audio_handler.mute()
+        
         # Queue audio for playback using new thread-safe method
         self._audio_player.queue_audio(audio_data)
         
@@ -314,6 +317,10 @@ class VoiceAssistant:
         """Handle turn completion from Gemini."""
         logger.debug("Gemini Turn abgeschlossen")
         self._last_activity_time = datetime.now()
+        
+        # Unmute microphone after assistant finishes speaking
+        # Small delay to let audio finish playing
+        asyncio.get_event_loop().call_later(0.3, self._audio_handler.unmute)
     
     def _check_supported_sample_rate(self, target_rate: int) -> tuple[int, bool]:
         """Check if target sample rate is supported, return (actual_rate, needs_resampling)."""

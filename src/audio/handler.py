@@ -43,6 +43,9 @@ class AudioHandler:
         self.actual_chunk_size = None
         self._needs_resampling = False
         self._sample_rate_checked = False
+        
+        # Mute flag to prevent self-hearing during playback
+        self._is_muted = False
     
     def _check_supported_sample_rate(self) -> tuple[int, bool]:
         """Check if target sample rate is supported, return (actual_rate, needs_resampling)."""
@@ -142,7 +145,7 @@ class AudioHandler:
                         logger.debug(f"Audio input overflow (#{self._overflow_count}) - normal beim Resampling")
                 else:
                     logger.warning(f"Audio status: {status}")
-            if self._is_recording and self._audio_queue:
+            if self._is_recording and self._audio_queue and not self._is_muted:
                 try:
                     # Resample if needed
                     if self._needs_resampling:
@@ -186,6 +189,9 @@ class AudioHandler:
                 while self._is_recording:
                     try:
                         data = stream.read(self.actual_chunk_size, exception_on_overflow=False)
+                        # Skip if muted (prevent self-hearing)
+                        if self._is_muted:
+                            continue
                         # Resample if needed
                         if self._needs_resampling:
                             audio_frame = np.frombuffer(data, dtype=np.int16)
@@ -221,6 +227,16 @@ class AudioHandler:
         
         self._audio_queue = None
         logger.info("Audio-Streaming gestoppt")
+    
+    def mute(self) -> None:
+        """Mute microphone input to prevent self-hearing during playback."""
+        self._is_muted = True
+        logger.debug("Mikrofon gemutet")
+    
+    def unmute(self) -> None:
+        """Unmute microphone input."""
+        self._is_muted = False
+        logger.debug("Mikrofon entmutet")
     
     async def get_audio_stream(self) -> AsyncGenerator[bytes, None]:
         """
